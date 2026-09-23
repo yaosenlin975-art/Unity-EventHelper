@@ -1,0 +1,7 @@
+{
+  "name": "com.lin.runtime-event-helper",
+  "version": "1.0.0",
+  "displayName": "Lin Runtime Event Helper",
+  "description": "Struct-based global and GameObject-local event dispatch helpers for Unity.",
+  "unity": "2021.3"
+}
