@@ -40,8 +40,13 @@ namespace Lin.Runtime.Helper
             get
             {
                 var context = mainThreadContext;
+                // 上下文靠 [InitializeOnLoadMethod] 或 [RuntimeInitializeOnLoadMethod] 捕获，但 Unity
+                // 不保证它们与调用方 [InitializeOnLoad] 静态构造的先后顺序：这里直接抛会连带把调用方
+                // 打成 TypeInitializationException，事件系统对整个编辑器会话永久失效。
+                // 未捕获时按主线程就地执行，也不拿调用方线程冒充主线程（工作线程在捕获前碰事件的概率极低，
+                // 而一旦缓存下来，真主线程反而会被判成跨线程）
                 if (context is null)
-                    throw new InvalidOperationException("EventHelper 主线程上下文尚未初始化。");
+                    return true;
 
                 return Thread.CurrentThread.ManagedThreadId == context.ThreadId;
             }
@@ -129,6 +134,8 @@ namespace Lin.Runtime.Helper
             // 派发期间收集到的待处理增删,执行前后统一应用,避免 foreach 迭代中修改 handlers
             private static List<Action<T>> pendingAdds;
             private static List<Action<T>> pendingRemoves;
+            // 重入派发保护：同一 T 的 handler 里再 Dispatch 时置位，禁止嵌套改 handlers
+            private static bool dispatching;
 
             public static void Register(Action<T> handler)
             {
@@ -211,18 +218,38 @@ namespace Lin.Runtime.Helper
 
             public static void DispatchOnMainThread(T args)
             {
+                // 重入派发（handler 里再 Dispatch 同一个 T）只走遍历，不碰 handlers：
+                // 否则内层 ApplyPending 会改外层 foreach 正在遍历的列表，甚至把它归还进池
+                if (dispatching)
+                {
+                    InvokeHandlers(args);
+                    return;
+                }
+
                 // 执行前: 把上次派发累积的待处理增删先应用到 handlers
                 ApplyPending();
 
+                dispatching = true;
+                try
+                {
+                    InvokeHandlers(args);
+                }
+                finally
+                {
+                    dispatching = false;
+                    // 执行后: 把本次派发期间产生的 Register/Deregister 也应用,避免跨周期累积
+                    ApplyPending();
+                }
+            }
+
+            private static void InvokeHandlers(T args)
+            {
                 if (handlers is null)
                     return;
 
                 // 执行: 此时 handlers 在整个迭代过程中不会被修改
                 foreach (var handler in handlers)
                     handler(args);
-
-                // 执行后: 把本次派发期间产生的 Register/Deregister 也应用,避免跨周期累积
-                ApplyPending();
             }
 
             private static void ApplyPending()
