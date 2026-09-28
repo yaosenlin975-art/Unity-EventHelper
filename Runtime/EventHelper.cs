@@ -20,6 +20,8 @@ namespace Lin.Runtime.Helper
     {
         private static volatile MainThreadContext mainThreadContext;
         private static readonly SendOrPostCallback PROCESS_EVENT_REQUEST = ProcessEventRequest;
+        // EventMap<T> 各封闭泛型的静态清理回调：禁用域重载时它们会跨 Play 残留，必须能统一清掉
+        private static readonly List<Action> clearActions = new List<Action>();
 
         public static void Register<T>(Action<T> handler) where T : struct => EventMap<T>.Register(handler);
 
@@ -29,6 +31,24 @@ namespace Lin.Runtime.Helper
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
         private static void CaptureRuntimeMainThreadContext() => CaptureMainThreadContext();
+
+        // 禁用域重载时 EventMap 静态字段跨 Play 残留，上一局的 handler 可能挂在已销毁对象上，
+        // 下一局派发就会打到死对象。SubsystemRegistration 每次进 Play 都会跑，正好做进程级重置
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetAllEventMaps()
+        {
+            lock (clearActions)
+            {
+                for (int i = 0; i < clearActions.Count; i++)
+                    clearActions[i]();
+            }
+        }
+
+        private static void RegisterClearAction(Action clear)
+        {
+            lock (clearActions)
+                clearActions.Add(clear);
+        }
 
         internal static void CaptureMainThreadContext()
         {
@@ -137,6 +157,32 @@ namespace Lin.Runtime.Helper
             // 重入派发保护：同一 T 的 handler 里再 Dispatch 时置位，禁止嵌套改 handlers
             private static bool dispatching;
 
+            static EventMap()
+            {
+                // 首次访问该 T 时挂上清理回调，供进 Play 时统一重置
+                RegisterClearAction(ClearStaticState);
+            }
+
+            private static void ClearStaticState()
+            {
+                if (handlers is not null)
+                {
+                    ListPool<Action<T>>.Release(handlers);
+                    handlers = null;
+                }
+                if (pendingAdds is not null)
+                {
+                    ListPool<Action<T>>.Release(pendingAdds);
+                    pendingAdds = null;
+                }
+                if (pendingRemoves is not null)
+                {
+                    ListPool<Action<T>>.Release(pendingRemoves);
+                    pendingRemoves = null;
+                }
+                dispatching = false;
+            }
+
             public static void Register(Action<T> handler)
             {
                 if (IsMainThread)
@@ -186,6 +232,17 @@ namespace Lin.Runtime.Helper
                 if (handlers is not null && handlers.Contains(handler))
                     return;
 
+                // 非派发期间立即生效：原先一律进 pendingAdds，要等下一次 Dispatch 的 ApplyPending，
+                // 禁用域重载时 pending 会跨 Play 残留
+                if (!dispatching)
+                {
+                    if (handlers is null)
+                        handlers = ListPool<Action<T>>.Get();
+                    if (!handlers.Contains(handler))
+                        handlers.Add(handler);
+                    return;
+                }
+
                 if (pendingAdds is null)
                     pendingAdds = ListPool<Action<T>>.Get();
 
@@ -208,6 +265,18 @@ namespace Lin.Runtime.Helper
 
                 if (handlers is null || !handlers.Contains(handler))
                     return;
+
+                // 非派发期间立即摘除，避免 handler 挂到已毁对象上还留在表里
+                if (!dispatching)
+                {
+                    handlers.Remove(handler);
+                    if (handlers.Count == 0)
+                    {
+                        ListPool<Action<T>>.Release(handlers);
+                        handlers = null;
+                    }
+                    return;
+                }
 
                 if (pendingRemoves is null)
                     pendingRemoves = ListPool<Action<T>>.Get();
@@ -247,9 +316,19 @@ namespace Lin.Runtime.Helper
                 if (handlers is null)
                     return;
 
-                // 执行: 此时 handlers 在整个迭代过程中不会被修改
-                foreach (var handler in handlers)
-                    handler(args);
+                // 逐 handler 隔离异常：单个订阅者抛错不应中断整轮派发。
+                // 派发期间 handlers 不会被修改（增删走 pending），按下标遍历是安全的
+                for (int i = 0; i < handlers.Count; i++)
+                {
+                    try
+                    {
+                        handlers[i](args);
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.LogException(exception);
+                    }
+                }
             }
 
             private static void ApplyPending()
